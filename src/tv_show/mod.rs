@@ -44,6 +44,10 @@ pub async fn get_tv_show_id(slug: &str) -> Result<i32> {
 
 /// Downloads all episodes for a TV show, filtering and scheduling concurrently.
 ///
+/// When `season` is `Some(n)`, every downloaded episode is tagged with that
+/// season for the auto-naming convention. Pass `None` to use the source API's
+/// own season metadata (currently always `None`).
+///
 /// # Errors
 ///
 /// Returns an error if episode fetching or any download task fails.
@@ -52,6 +56,7 @@ pub async fn download(
     tv_show_id: i32,
     start_from_episode: i32,
     params: &DownloadParams,
+    season: Option<i32>,
 ) -> anyhow::Result<()> {
     let episodes = episodes::get_episodes(&params.http_client, tv_show_id).await?;
 
@@ -63,6 +68,10 @@ pub async fn download(
                 false
             }
             _ => true,
+        })
+        .map(|mut ep| {
+            ep.season = season;
+            ep
         })
         .collect();
 

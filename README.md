@@ -35,6 +35,9 @@ Descarrega el binari des de [releases](https://github.com/mcamara/3cat_show_down
 | `--skip-subtitles` | | No descarregar els subtítols | `false` |
 | `--fix-existing-subtitles` | `-f` | Netejar els fitxers de subtítols (.vtt) ja descarregats al directori | `false` |
 | `--embed-existing-subtitles` | | Netejar i incrustar els subtítols als videos ja descarregats (requereix ffmpeg) | `false` |
+| `--strict-subtitles` | | Aborta la descarrega completa si falla la descarrega o neteja dels subtítols dun episodi. Per defecte, els errors de subtítols simplement saxon amb un warning i el video es desa igual. | `false` |
+| `--auto-naming` | | Desa els fitxers amb el format `Mic - <slug> - SXXEYY (<ext>)` dins `Temporada XX/` (episodis) o `Pel·lícules/` (pel·lícules). | `false` |
+| `--season` | | Numero de temporada utilitzat per `--auto-naming`. Es zero-padded a dos digits. | `1` |
 
 Per exemple, per descarregar una sèrie amb 4 capítols alhora en paral·lel:
 

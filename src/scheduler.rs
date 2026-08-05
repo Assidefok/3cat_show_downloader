@@ -21,6 +21,11 @@ use crate::models::{DownloadParams, MediaItem};
 /// instance. If any task fails, all remaining tasks are aborted and the first
 /// error is returned.
 ///
+/// Per-task subtitle failures in tolerant mode are logged as warnings
+/// inside [`downloader::fetch_and_download_media`] and do not propagate
+/// here, so the batch continues. Pass `--strict-subtitles` to revert to
+/// the fail-fast behaviour (any subtitle error aborts the whole batch).
+///
 /// # Errors
 ///
 /// Returns the first error encountered by any download task, or a
@@ -40,13 +45,17 @@ pub async fn download_all(items: Vec<MediaItem>, params: &DownloadParams) -> any
                 .await
                 .map_err(|e| Error::Downloading(e.to_string()))?;
 
+            // `subtitle_failed` flag is logged at the warning site; we
+            // discard it here because the scheduler does not aggregate
+            // per-item state. The user sees the warning lines above the
+            // progress bars.
             downloader::fetch_and_download_media(item, &task_params).await
         });
     }
 
     while let Some(result) = join_set.join_next().await {
         match result {
-            Ok(Ok(())) => {}
+            Ok(Ok(_subtitle_failed)) => {}
             Ok(Err(e)) => {
                 join_set.abort_all();
                 return Err(e.into());

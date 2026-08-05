@@ -14,7 +14,7 @@ use std::process::Stdio;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 use crate::error::{Error, Result};
 use crate::ffmpeg;
@@ -61,14 +61,24 @@ pub async fn is_available() -> bool {
 /// non-zero status.
 #[instrument(skip_all, fields(media_id = item.id))]
 pub async fn download(
-    item: &MediaItem,
+    item: &mut MediaItem,
     directory: &str,
     subtitle_mode: SubtitleMode,
     multi_progress: &MultiProgress,
-) -> Result<()> {
+    strict_subtitles: bool,
+    auto_naming: bool,
+) -> Result<bool> {
     let url = format!("{}{}", CCMA_VIDEO_URL_BASE, item.id);
-    let output_filename = item.filename("%(ext)s")?;
-    let output_template = std::path::Path::new(directory)
+    let output_filename = item.filename("%(ext)s", auto_naming)?;
+    let mut base_path = std::path::PathBuf::from(directory);
+    if let Some(sub) = item.subdirectory(auto_naming) {
+        base_path.push(sub);
+        // Create the subdirectory eagerly so yt-dlp can write into it.
+        tokio::fs::create_dir_all(&base_path)
+            .await
+            .map_err(|e| Error::YtDlp(format!("failed to create {base_path:?}: {e}")))?;
+    }
+    let output_template = base_path
         .join(&output_filename)
         .to_str()
         .ok_or_else(|| Error::InvalidPathEncoding(output_filename.clone()))?
@@ -149,25 +159,54 @@ pub async fn download(
     }
 
     if subtitle_mode == SubtitleMode::Skip {
-        return Ok(());
+        return Ok(false);
+    }
+
+    // Build the search directory (auto-naming subdir if applicable).
+    let mut search_dir = std::path::PathBuf::from(directory);
+    if let Some(sub) = item.subdirectory(auto_naming) {
+        search_dir.push(sub);
     }
 
     // Collect subtitle files written by yt-dlp: {stem}.{lang}.vtt
     let subtitle_langs = ["ca", "en", "es"];
     let mut found: Vec<(PathBuf, &str)> = Vec::new();
     for &lang in &subtitle_langs {
-        let vtt_path = std::path::Path::new(directory).join(item.filename(&format!("{lang}.vtt"))?);
+        let vtt_path = search_dir.join(item.filename(&format!("{lang}.vtt"), auto_naming)?);
         if vtt_path.exists() {
             found.push((vtt_path, lang));
         }
     }
 
     if found.is_empty() {
-        return Err(Error::NoSubtitlesAvailable(item.title.clone()));
+        if strict_subtitles {
+            return Err(Error::NoSubtitlesAvailable(item.title.clone()));
+        }
+        warn!(
+            "No subtitles available for '{}'. Saving video without subtitles; rerun with --strict-subtitles to abort on missing subs.",
+            item.title
+        );
+        item.subtitle_failed = true;
+        return Ok(true);
     }
 
+    let mut cleaning_failed = false;
     for (vtt_path, _) in &found {
-        subtitle_cleaner::clean_vtt_file(vtt_path)?;
+        if let Err(e) = subtitle_cleaner::clean_vtt_file(vtt_path) {
+            if strict_subtitles {
+                return Err(e);
+            }
+            warn!(
+                "Subtitle cleaning failed for '{}' ({}): {e}. Saving video without cleaned subs.",
+                item.title,
+                vtt_path.display()
+            );
+            item.subtitle_failed = true;
+            cleaning_failed = true;
+        }
+    }
+    if cleaning_failed {
+        return Ok(true);
     }
 
     if subtitle_mode == SubtitleMode::Embed {
@@ -179,8 +218,8 @@ pub async fn download(
             })
             .collect();
 
-        let video_filename = item.filename("mp4")?;
-        let video_path = std::path::Path::new(directory).join(&video_filename);
+        let video_filename = item.filename("mp4", auto_naming)?;
+        let video_path = search_dir.join(&video_filename);
         let video_str = video_path
             .to_str()
             .ok_or_else(|| Error::InvalidPathEncoding(video_filename.clone()))?;
@@ -193,7 +232,7 @@ pub async fn download(
         }
     }
 
-    Ok(())
+    Ok(item.subtitle_failed)
 }
 
 /// Parses a yt-dlp `--progress --newline` stdout line into a progress position
@@ -264,16 +303,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_should_fail_download_with_invalid_id() {
-        let item = MediaItem {
+        let mut item = MediaItem {
             id: 1,
             title: "Test episode".to_string(),
             video_url: None,
             subtitle_url: None,
             episode_number: Some(1),
             tv_show_name: Some("Test show".to_string()),
+            season: None,
+            subtitle_failed: false,
         };
         let mp = MultiProgress::new();
-        let result = download(&item, "/tmp", SubtitleMode::Skip, &mp).await;
+        let result = download(&mut item, "/tmp", SubtitleMode::Skip, &mp, false, false).await;
         assert!(result.is_err());
     }
 }

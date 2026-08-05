@@ -138,10 +138,26 @@ pub async fn run(args: CatShowDownloaderArgs, multi_progress: MultiProgress) -> 
         SubtitleMode::Download
     };
 
+    if args.strict_subtitles {
+        info!("--strict-subtitles set: subtitle failures will abort the batch");
+    } else {
+        info!(
+            "Subtitle failures will be tolerated (warn + skip). Pass --strict-subtitles to abort on failures."
+        );
+    }
+
+    if args.auto_naming {
+        info!(
+            "--auto-naming set: files will be saved as 'Mic - <slug> - S{:02}E<ep> (<fmt>)' under Temporada XX/ (or Pel·lícules/ for movies); season defaults to {}",
+            args.season, args.season
+        );
+    }
+
     if yt_dlp_available {
         info!("yt-dlp detected, using it as the download backend");
     }
 
+    let auto_naming = args.auto_naming;
     let params = DownloadParams {
         http_client,
         subtitle_mode,
@@ -149,10 +165,15 @@ pub async fn run(args: CatShowDownloaderArgs, multi_progress: MultiProgress) -> 
         multi_progress,
         directory: Arc::from(args.directory.as_str()),
         yt_dlp_available,
+        strict_subtitles: args.strict_subtitles,
+        auto_naming,
     };
+    let season = i32::try_from(args.season).ok();
 
     let result = match media {
-        MediaType::TvShow(id) => tv_show::download(id, args.start_from_episode, &params).await,
+        MediaType::TvShow(id) => {
+            tv_show::download(id, args.start_from_episode, &params, season).await
+        }
         MediaType::Movie { id, slug } => movie::download(id, &slug, &params).await,
     };
 

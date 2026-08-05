@@ -32,4 +32,21 @@ pub struct CatShowDownloaderArgs {
     /// Clean and embed existing subtitle files into their matching video files (requires ffmpeg)
     #[arg(long, default_value_t = false)]
     pub(crate) embed_existing_subtitles: bool,
+
+    /// Abort the whole batch if a subtitle fails to download, clean, or embed.
+    /// Without this flag, subtitle failures are logged as warnings and the
+    /// affected episodes are reported in the final summary.
+    #[arg(long, default_value_t = false)]
+    pub(crate) strict_subtitles: bool,
+
+    /// Save files using the `Mic - <episode_slug> - S<season>E<episode> (<ext>)`
+    /// naming convention and organize episodes into `Temporada XX/` (or
+    /// `Pel·lícules/` for movies) subdirectories under the output directory.
+    #[arg(long, default_value_t = false)]
+    pub(crate) auto_naming: bool,
+
+    /// Season number used when `--auto-naming` is set. Defaults to 1.
+    /// Zero-padded to two digits in the generated filename.
+    #[arg(long, default_value_t = 1)]
+    pub(crate) season: u32,
 }

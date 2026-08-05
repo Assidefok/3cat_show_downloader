@@ -23,7 +23,10 @@ where
     let tv3_tv_show_api_response = http_client
         .get::<api_structs::EpisodesRoot, api_structs::Tv3Error>(&url, None)
         .await
-        .map_err(|e| Error::Decoding(e.to_string()))?;
+        .map_err(|e| Error::Decoding {
+            context: format!("episode list url={url}"),
+            source: Box::new(e),
+        })?;
 
     let episode_list = tv3_tv_show_api_response.response.items.item;
     if episode_list.is_empty() {
@@ -31,18 +34,28 @@ where
     }
 
     for item in episode_list {
+        // Skip items missing the minimum data needed to build a MediaItem.
+        // The 3cat API returns heterogeneous items (e.g., trailers lacking
+        // `programa` or `permatitle`); these would otherwise produce invalid
+        // MediaItems downstream.
+        let (Some(id), Some(perma)) = (item.id, item.permatitle.as_ref()) else {
+            continue;
+        };
+
         let title = match item.title {
             Some(t) if !t.is_empty() => t,
-            _ => item.permatitle,
+            _ => perma.clone(),
         };
 
         episodes.push(MediaItem {
-            id: item.id,
+            id,
             title,
             video_url: None,
             subtitle_url: None,
-            episode_number: Some(item.number_of_episode),
-            tv_show_name: Some(item.tv_show_name),
+            episode_number: item.number_of_episode,
+            tv_show_name: item.tv_show_name,
+            season: None,
+            subtitle_failed: false,
         });
     }
 
