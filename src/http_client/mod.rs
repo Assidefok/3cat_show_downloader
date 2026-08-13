@@ -96,8 +96,7 @@ impl HttpClientTrait for HttpClient {
 
         // [DEBUG-decode] read body as bytes so we can dump a preview on JSON failure
         let bytes = response.bytes().await.map_err(Error::RequestBodyRead)?;
-        let parsed: std::result::Result<T, serde_json::Error> =
-            serde_json::from_slice(&bytes);
+        let parsed: std::result::Result<T, serde_json::Error> = serde_json::from_slice(&bytes);
         match parsed {
             Ok(value) => Ok(value),
             Err(e) => {

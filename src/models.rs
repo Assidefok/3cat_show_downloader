@@ -7,7 +7,26 @@ use regex::Regex;
 use unidecode::unidecode;
 
 use crate::error::Result;
+use crate::ffmpeg::EncoderCapabilities;
 use crate::http_client::HttpClient;
+use crate::transcode::ReencodePreset;
+
+/// Plex-facing identity and local metadata for a TV episode.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlexEpisodeMetadata {
+    /// Aired-order season exposed to Plex.
+    pub season: i32,
+    /// Aired-order episode exposed to Plex.
+    pub episode: i32,
+    /// TheTVDB episode record ID when a reliable match exists.
+    pub tvdb_episode_id: Option<u64>,
+    /// 3Cat synopsis, kept in Catalan.
+    pub plot: Option<String>,
+    /// 3Cat broadcast date in ISO `YYYY-MM-DD` form.
+    pub aired: Option<String>,
+    /// 3Cat duration string.
+    pub duration: Option<String>,
+}
 
 /// Controls how subtitles are handled during media downloads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,10 +72,31 @@ pub struct DownloadParams {
     /// subdirectories under the user-supplied output directory.
     /// See `--auto-naming` in the CLI.
     pub auto_naming: bool,
+    /// Optional re-encoding preset applied to each downloaded file after
+    /// the subtitle pipeline finishes. `Off` means no re-encoding.
+    /// See `--reencode` in the CLI.
+    pub reencode_preset: ReencodePreset,
+    /// Snapshot of which video encoders the host `ffmpeg` advertises,
+    /// captured once at startup by [`crate::ffmpeg::probe_encoders`].
+    /// Used by [`crate::transcode::reencode`] to prefer the GPU
+    /// (`h264_nvenc` / `hevc_nvenc`) over software (`libx264` / `libx265`)
+    /// when re-encoding is requested. Wrapped in an `Arc` so per-task
+    /// clones don't copy the inner `Vec`s.
+    pub reencode_capabilities: Arc<EncoderCapabilities>,
+    /// Delay between consecutive yt-dlp invocations, in milliseconds.
+    /// 3cat.cat's CDN tends to return `HTTP 503 backend read error` when
+    /// requests are fired in tight succession; the scheduler applies this
+    /// delay before each yt-dlp launch so the API stays responsive.
+    /// See `--request-delay-ms` in the CLI.
+    pub request_delay_ms: u64,
+    /// Whether Plex naming, NFO, and Matroska tagging are enabled.
+    pub plex_metadata: bool,
+    /// TheTVDB series ID used by Plex metadata mode.
+    pub tvdb_series_id: Option<u32>,
 }
 
 /// Represents a downloadable media item (TV show episode or movie).
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct MediaItem {
     /// Internal 3cat media ID.
     pub id: i32,
@@ -79,6 +119,8 @@ pub struct MediaItem {
     /// Reported in the final run summary so the user can decide whether to
     /// retry with `--skip-subtitles` or `--strict-subtitles`.
     pub subtitle_failed: bool,
+    /// Plex metadata populated by the optional Plex workflow.
+    pub plex: Option<PlexEpisodeMetadata>,
 }
 
 impl MediaItem {
@@ -101,13 +143,25 @@ impl MediaItem {
     pub fn filename(&self, extension: &str, auto_naming: bool) -> Result<String> {
         let slug = Self::slugify(&self.title)?;
 
+        if let Some(plex) = &self.plex {
+            let title = Self::windows_safe_title(&self.title);
+            return Ok(format!(
+                "MIC3 - S{:02}E{:02} - {title} [1080p].{extension}",
+                plex.season, plex.episode
+            ));
+        }
+
         if auto_naming {
+            // The trailing tag is always the canonical resolution, not the
+            // container extension. This keeps the filename stable regardless
+            // of which container yt-dlp chooses (mp4/mkv/webm) and avoids
+            // confusion with the codec label inside the parens.
             return Ok(match (self.episode_number, self.season) {
-                (Some(ep), Some(season)) => format!(
-                    "Mic - {slug} - S{season:02}E{ep:02} ({extension})"
-                ),
-                (Some(ep), None) => format!("Mic - {slug} - S01E{ep:02} ({extension})"),
-                (None, _) => format!("Mic - {slug} ({extension})"),
+                (Some(ep), Some(season)) => {
+                    format!("Mic - {slug} - S{season:02}E{ep:02} (1080p)")
+                }
+                (Some(ep), None) => format!("Mic - {slug} - S01E{ep:02} (1080p)"),
+                (None, _) => format!("Mic - {slug} (1080p)"),
             });
         }
 
@@ -131,6 +185,9 @@ impl MediaItem {
     /// * **Episode without season** but with episode_number: `Temporada 01/`.
     /// * **Item with no episode_number and no season** (treated as movie): `Pel·lícules/`.
     pub fn subdirectory(&self, auto_naming: bool) -> Option<String> {
+        if let Some(plex) = &self.plex {
+            return Some(format!("Season {:02}", plex.season));
+        }
         if !auto_naming {
             return None;
         }
@@ -152,6 +209,21 @@ impl MediaItem {
         let collapsed = Regex::new(r"-+")?.replace_all(&dash_replaced, "-");
         Ok(collapsed.trim_matches('-').to_string())
     }
+
+    fn windows_safe_title(title: &str) -> String {
+        let cleaned: String = title
+            .chars()
+            .map(|c| {
+                if matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect();
+        let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+        collapsed.trim_matches([' ', '.']).to_string()
+    }
 }
 
 #[cfg(test)]
@@ -169,10 +241,11 @@ mod tests {
             tv_show_name: Some("Tv show name".to_string()),
             season: None,
             subtitle_failed: false,
+            plex: None,
         };
         assert_eq!(
-            item.filename("mp4", false).unwrap(),
-            "7-t1xc7-veureu-una-cosa-allucinant-i-magica.mp4"
+            item.filename("mkv", false).unwrap(),
+            "7-t1xc7-veureu-una-cosa-allucinant-i-magica.mkv"
         );
     }
 
@@ -187,10 +260,11 @@ mod tests {
             tv_show_name: Some("Tv show name (OVA)".to_string()),
             season: None,
             subtitle_failed: false,
+            plex: None,
         };
         assert_eq!(
-            item.filename("mp4", false).unwrap(),
-            "ova-7-t1xc7-veureu-una-cosa-allucinant.mp4"
+            item.filename("mkv", false).unwrap(),
+            "ova-7-t1xc7-veureu-una-cosa-allucinant.mkv"
         );
     }
 
@@ -205,10 +279,11 @@ mod tests {
             tv_show_name: None,
             season: None,
             subtitle_failed: false,
+            plex: None,
         };
         assert_eq!(
-            item.filename("mp4", false).unwrap(),
-            "el-secret-de-la-cova.mp4"
+            item.filename("mkv", false).unwrap(),
+            "el-secret-de-la-cova.mkv"
         );
     }
 
@@ -223,15 +298,13 @@ mod tests {
             tv_show_name: Some("Bola de Drac".to_string()),
             season: Some(1),
             subtitle_failed: false,
+            plex: None,
         };
         assert_eq!(
-            item.filename("mp4", true).unwrap(),
-            "Mic - t1xc7-veureu-una-cosa-allucinant-i-magica - S01E07 (mp4)"
+            item.filename("mkv", true).unwrap(),
+            "Mic - t1xc7-veureu-una-cosa-allucinant-i-magica - S01E07 (1080p)"
         );
-        assert_eq!(
-            item.subdirectory(true).as_deref(),
-            Some("Temporada 01")
-        );
+        assert_eq!(item.subdirectory(true).as_deref(), Some("Temporada 01"));
     }
 
     #[test]
@@ -245,15 +318,13 @@ mod tests {
             tv_show_name: None,
             season: None,
             subtitle_failed: false,
+            plex: None,
         };
         assert_eq!(
-            item.filename("mp4", true).unwrap(),
-            "Mic - el-secret-de-la-cova (mp4)"
+            item.filename("mkv", true).unwrap(),
+            "Mic - el-secret-de-la-cova (1080p)"
         );
-        assert_eq!(
-            item.subdirectory(true).as_deref(),
-            Some("Pel·lícules")
-        );
+        assert_eq!(item.subdirectory(true).as_deref(), Some("Pel·lícules"));
     }
 
     #[test]
@@ -267,10 +338,11 @@ mod tests {
             tv_show_name: Some("Show".to_string()),
             season: None,
             subtitle_failed: false,
+            plex: None,
         };
         assert_eq!(
-            item.filename("mp4", true).unwrap(),
-            "Mic - pilot - S01E03 (mp4)"
+            item.filename("mkv", true).unwrap(),
+            "Mic - pilot - S01E03 (1080p)"
         );
     }
 
@@ -285,10 +357,11 @@ mod tests {
             tv_show_name: Some("Show".to_string()),
             season: Some(123),
             subtitle_failed: false,
+            plex: None,
         };
         assert_eq!(
-            item.filename("mp4", true).unwrap(),
-            "Mic - final - S123E01 (mp4)"
+            item.filename("mkv", true).unwrap(),
+            "Mic - final - S123E01 (1080p)"
         );
     }
 
@@ -303,6 +376,7 @@ mod tests {
             tv_show_name: Some("Show".to_string()),
             season: Some(1),
             subtitle_failed: false,
+            plex: None,
         };
         assert_eq!(item.subdirectory(false), None);
     }

@@ -4,7 +4,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::Client;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
-use tracing::{info, instrument, warn};
+use tracing::{debug, instrument, warn};
 
 use crate::api_structs;
 use crate::error::{Error, Result};
@@ -12,6 +12,7 @@ use crate::ffmpeg;
 use crate::http_client::HttpClientTrait;
 use crate::models::{DownloadParams, MediaItem, SubtitleMode};
 use crate::subtitle_cleaner;
+use crate::transcode;
 use crate::yt_dlp;
 
 const TV3_SINGLE_MEDIA_API_URL: &str =
@@ -41,9 +42,19 @@ pub async fn fetch_and_download_media(
     params: &DownloadParams,
 ) -> Result<bool> {
     if params.yt_dlp_available {
-        if check_if_media_exists(&item, &params.directory, params.auto_naming).await? {
-            info!("Media item already exists: {}", item.filename("mp4", params.auto_naming)?);
-            return Ok(false);
+        let already_exists =
+            check_if_media_exists(&item, &params.directory, params.auto_naming).await?;
+        if already_exists {
+            debug!(
+                "Media item already exists: {} — applying reencode only",
+                item.filename("(1080p)", params.auto_naming)?
+            );
+            // Re-run the post-download pipeline on the existing file. We
+            // delegate to yt_dlp::download, which resolves the actual file
+            // yt-dlp wrote (or that already exists), embeds subtitles if
+            // asked, and then re-encodes. This way a previously downloaded
+            // episode gets the reencode applied (and the subs pipeline
+            // re-run) without hitting the network a second time.
         }
         ensure_subdir(&item, &params.directory, params.auto_naming).await?;
         let subtitle_failed = yt_dlp::download(
@@ -53,6 +64,9 @@ pub async fn fetch_and_download_media(
             &params.multi_progress,
             params.strict_subtitles,
             params.auto_naming,
+            params.reencode_preset,
+            &params.reencode_capabilities,
+            params.request_delay_ms,
         )
         .await?;
         return Ok(subtitle_failed);
@@ -130,6 +144,8 @@ pub async fn fetch_and_download_media(
         params.subtitle_mode,
         params.strict_subtitles,
         params.auto_naming,
+        params.reencode_preset,
+        &params.reencode_capabilities,
     )
     .await?;
     Ok(subtitle_failed || item.subtitle_failed)
@@ -144,7 +160,8 @@ pub async fn fetch_and_download_media(
 /// # Errors
 ///
 /// Returns an error if downloading, file I/O, or path encoding fails.
-#[allow(clippy::too_many_arguments)] // Per-task context assembled from DownloadParams; keeping them explicit avoids an ad-hoc struct for a single callsite.
+#[allow(clippy::too_many_arguments)]
+// Per-task context assembled from DownloadParams; keeping them explicit avoids an ad-hoc struct for a single callsite.
 #[instrument(skip_all, fields(media_id = item.id))]
 async fn download_media(
     item: &mut MediaItem,
@@ -154,15 +171,20 @@ async fn download_media(
     subtitle_mode: SubtitleMode,
     strict_subtitles: bool,
     auto_naming: bool,
+    reencode_preset: transcode::ReencodePreset,
+    capabilities: &ffmpeg::EncoderCapabilities,
 ) -> Result<bool> {
     if check_if_media_exists(item, directory, auto_naming).await? {
-        info!("Media item already exists: {}", item.filename("mp4", auto_naming)?);
+        debug!(
+            "Media item already exists: {}",
+            item.filename("mkv", auto_naming)?
+        );
         return Ok(false);
     }
 
     ensure_subdir(item, directory, auto_naming).await?;
 
-    let subtitle_failed = download_data(
+    let (final_path, subtitle_failed) = download_data(
         item,
         directory,
         multi_progress,
@@ -173,10 +195,30 @@ async fn download_media(
     )
     .await?;
 
+    if !reencode_preset.is_off() {
+        // Tolerate re-encode failure: warn and keep the original file so the
+        // user still has a playable episode.
+        if let Err(e) =
+            transcode::reencode(&final_path, reencode_preset, capabilities, multi_progress).await
+        {
+            warn!("Re-encoding failed for {final_path}: {e}. Original file preserved.");
+        }
+    }
+
+    // Final-stage guarantee: every downloaded file ends up as a `.mkv`,
+    // regardless of which container yt-dlp / the built-in downloader
+    // produced. Re-encode already writes MKV; subtitle embed already
+    // produces MKV; this remux covers the "no-embed, no-reencode" case.
+    // Idempotent: short-circuits when the file is already `.mkv`.
+    if let Err(e) = ffmpeg::remux_to_mkv(std::path::Path::new(&final_path)).await {
+        warn!("Remux to MKV failed for {final_path}: {e}. Original file preserved.");
+    }
+
     Ok(subtitle_failed || item.subtitle_failed)
 }
 
-#[allow(clippy::too_many_arguments)] // Same justification as download_media: per-task flat context built from DownloadParams once per episode.
+#[allow(clippy::too_many_arguments)]
+// Same justification as download_media: per-task flat context built from DownloadParams once per episode.
 #[instrument(skip_all)]
 async fn download_data(
     item: &mut MediaItem,
@@ -186,13 +228,15 @@ async fn download_data(
     subtitle_mode: SubtitleMode,
     strict_subtitles: bool,
     auto_naming: bool,
-) -> Result<bool> {
+) -> Result<(String, bool)> {
     let Some(video_url) = &item.video_url else {
-        return Err(Error::MediaDoesNotHaveVideoUrl(item.filename("mp4", auto_naming)?));
+        return Err(Error::MediaDoesNotHaveVideoUrl(
+            item.filename("mkv", auto_naming)?,
+        ));
     };
 
-    let video_filename = item.filename("mp4", auto_naming)?;
-    let video_path = full_media_path(item, directory, "mp4", auto_naming)?;
+    let video_filename = item.filename("mkv", auto_naming)?;
+    let video_path = full_media_path(item, directory, "mkv", auto_naming)?;
     download_content(
         video_url,
         &video_path,
@@ -201,13 +245,14 @@ async fn download_data(
         client,
     )
     .await?;
-    info!("Downloaded video to {video_path}");
+    debug!("Downloaded video to {video_path}");
 
-    if subtitle_mode == SubtitleMode::Skip {
-        return Ok(false);
-    }
+    let mut subtitle_failed = false;
+    let mut final_path = video_path.clone();
 
-    if let Some(subtitle_url) = &item.subtitle_url {
+    if subtitle_mode != SubtitleMode::Skip
+        && let Some(subtitle_url) = &item.subtitle_url
+    {
         let subtitle_filename = item.filename("vtt", auto_naming)?;
         let subtitle_path = full_media_path(item, directory, "vtt", auto_naming)?;
         let video_path_for_subtitles = video_path.clone();
@@ -230,36 +275,54 @@ async fn download_data(
                 };
                 match ffmpeg::embed_subtitles(&video_path_for_subtitles, &[track]).await {
                     Ok(mkv_path) => {
-                        info!("Subtitles embedded into video {mkv_path}");
+                        debug!("Subtitles embedded into video {mkv_path}");
                     }
                     Err(e) => {
-                        warn!(
-                            "Failed to embed subtitles into {video_path_for_subtitles}: {e}"
-                        );
-                        info!("Downloaded subtitle to {subtitle_path}");
+                        warn!("Failed to embed subtitles into {video_path_for_subtitles}: {e}");
+                        debug!("Downloaded subtitle to {subtitle_path}");
                     }
                 }
             } else {
-                info!("Downloaded subtitle to {subtitle_path}");
+                debug!("Downloaded subtitle to {subtitle_path}");
             }
 
             Ok::<_, Error>(())
         }
         .await;
 
-        if let Err(e) = subtitle_result {
-            if strict_subtitles {
-                return Err(e);
+        match subtitle_result {
+            Ok(()) => {
+                // If embed succeeded, `embed_subtitles` renamed the file to
+                // `.mkv` and removed the original `.mp4`. Surface the
+                // post-embed path so re-encode targets the right file.
+                let mkv_path = video_path_with_extension(&video_path_for_subtitles, "mkv");
+                if std::path::Path::new(&mkv_path).exists() {
+                    final_path = mkv_path;
+                }
             }
-            warn!(
-                "Subtitle pipeline failed for '{}': {e}. Saving video without subtitles; rerun with --skip-subtitles to suppress this.",
-                item.title
-            );
-            item.subtitle_failed = true;
+            Err(e) => {
+                if strict_subtitles {
+                    return Err(e);
+                }
+                warn!(
+                    "Subtitle pipeline failed for '{}': {e}. Saving video without subtitles; rerun with --skip-subtitles to suppress this.",
+                    item.title
+                );
+                subtitle_failed = true;
+            }
         }
     }
 
-    Ok(item.subtitle_failed)
+    Ok((final_path, subtitle_failed))
+}
+
+/// Returns `path` with its file extension replaced by `new_ext`.
+fn video_path_with_extension(path: &str, new_ext: &str) -> String {
+    let p = std::path::Path::new(path);
+    match p.with_extension(new_ext).to_str() {
+        Some(s) => s.to_string(),
+        None => path.to_string(),
+    }
 }
 
 /// Video file extensions produced by yt-dlp or the built-in HTTP downloader.
@@ -271,10 +334,10 @@ const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mkv", "webm", "ts", "m4v"];
 /// Returns `true` when a non-empty video file with the same stem as `item`
 /// already exists in `directory`, regardless of container extension.
 ///
-/// This covers the case where yt-dlp chose an extension other than `.mp4`
+/// This covers the case where yt-dlp chose an extension other than `.mkv`
 /// (e.g. `.webm`) or where ffmpeg previously produced a `.mkv` after
-/// embedding subtitles.  Stale `.mp4.tmp` files left by interrupted
-/// HTTP downloads are cleaned up before the check.
+/// embedding subtitles.  Stale `.tmp` files left by interrupted
+/// downloads are cleaned up before the check.
 #[instrument(skip_all)]
 async fn check_if_media_exists(
     item: &MediaItem,
@@ -282,7 +345,7 @@ async fn check_if_media_exists(
     auto_naming: bool,
 ) -> Result<bool> {
     // Derive the stem (e.g. "7-episode-title") to match any video extension.
-    let filename = item.filename("mp4", auto_naming)?;
+    let filename = item.filename("mkv", auto_naming)?;
     let stem = std::path::Path::new(&filename)
         .file_stem()
         .and_then(|s| s.to_str())
@@ -409,9 +472,12 @@ async fn download_content(
         return result;
     }
 
-    tokio::fs::rename(&tmp_path, path)
-        .await
-        .map_err(|e| Error::Downloading(e.to_string()))?;
+    // `std::fs::rename` (not `tokio::fs::rename`) is intentional: on
+    // Windows the tokio variant does not set
+    // `MOVEFILE_REPLACE_EXISTING`, so it would fail when `path` already
+    // exists. `std::fs::rename` uses `MoveFileExW` with the replace flag
+    // on Windows and POSIX `rename(2)` (atomic replace) on Unix.
+    std::fs::rename(&tmp_path, path).map_err(|e| Error::Downloading(e.to_string()))?;
 
     Ok(())
 }
@@ -440,14 +506,16 @@ fn create_progress_bar(
 
 /// Creates a spinner-style progress bar when total size is unknown, registered with the [`MultiProgress`].
 ///
-/// # Errors
-///
-/// Returns an error if the spinner template is invalid.
+/// Renders with a moving indeterminate bar plus elapsed time so the user
+/// sees something moving instead of a single static line.
 fn create_spinner(label: &str, multi_progress: &MultiProgress) -> Result<ProgressBar> {
     let pb = multi_progress.add(ProgressBar::new_spinner());
     pb.set_style(
-        ProgressStyle::with_template("{prefix:.bold} {spinner:.cyan} ({bytes}) {bytes_per_sec}")
-            .map_err(|e| Error::Downloading(e.to_string()))?,
+        ProgressStyle::with_template(
+            "{prefix:.bold} [{bar:30.cyan/blue}] {elapsed_precise} ({bytes}) {bytes_per_sec}",
+        )
+        .map_err(|e| Error::Downloading(e.to_string()))?
+        .progress_chars("██░"),
     );
     pb.set_prefix(label.to_string());
     Ok(pb)
